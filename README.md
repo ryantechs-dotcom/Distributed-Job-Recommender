@@ -1,62 +1,58 @@
-# Job Recommendation System (LinkedIn Replica)
-  
-**Technologies:** PySpark, Word2Vec, KNN, TensorFlow, AWS EMR, S3, Collaborative Filtering
+# Distributed Job Recommendation Engine (PySpark on AWS EMR)
 
-## 📌 Overview
+A job recommender built on real job-application data. It learns semantic embeddings for job postings and user work histories with Word2Vec, retrieves candidate jobs with locality-sensitive hashing, and scores user–job pairs with a neural network. Everything runs as Spark jobs on AWS EMR, with data and intermediate artifacts stored in S3.
 
-This project is a large-scale job recommendation engine inspired by LinkedIn, designed to predict relevant job postings for users using both collaborative filtering and deep learning. The system processes and analyzes 3GB+ of user-job interaction data in a distributed environment.
+![PySpark](https://img.shields.io/badge/PySpark-E25A1C?style=flat-square&logo=apachespark&logoColor=white)
+![AWS](https://img.shields.io/badge/AWS%20EMR%20%2B%20S3-232F3E?style=flat-square&logo=amazonwebservices&logoColor=white)
+![TensorFlow](https://img.shields.io/badge/TensorFlow-FF6F00?style=flat-square&logo=tensorflow&logoColor=white)
 
-## 🧠 Objectives
+## Data
 
-- Predict jobs users are likely to apply for using past behavior and semantic job/user embeddings.
-- Build scalable infrastructure for model training and data processing.
-- Combine classical recommendation techniques (KNN) with neural network models for performance comparison.
+CareerBuilder job-application data from the Kaggle *Job Recommendation Challenge*: job postings, user profiles, user work histories, and applications, partitioned into 13 time windows (3 GB+ raw). The profile table alone covers ~390K users.
 
-## 🧱 Key Features
+## Pipeline
 
-- **Collaborative Filtering (KNN)**: Used `pyspark.ml` and a custom KNN implementation to recommend jobs based on similar users' application history.
-- **Text Embeddings with Word2Vec**: Generated vector representations for jobs and user activity using Word2Vec to capture contextual meaning.
-- **Deep Learning (TensorFlow)**: Built a neural network to predict job applications based on joined user-job embeddings.
-- **Batch Training with Window Filtering**: Used time windows to batch data and streamline model training for large-scale processing.
-- **Cloud Infrastructure**: Leveraged **AWS EMR clusters** for distributed processing and **Amazon S3** for scalable data storage and experiment tracking.
+```
+jobs (per window) ──► strip HTML, tokenize ──► Word2Vec (100-d) ──► job vectors ─────────────┐
+user_history      ──► job-title tokens     ──► Word2Vec (100-d) ──► mean ──► history vectors │
+users             ──► EDA, StringIndexer (state, major) + history vectors ──► user features  │
+apps              ──► join to job vectors per window ─────────────────────────────────────────┤
+                                                                                              ▼
+               ┌──────────── Retrieval: BucketedRandomProjectionLSH over job vectors ──► top-k jobs per user
+               └──────────── Ranking:   MLP on [user vector ‖ job vector] ──► P(apply)
+```
 
-## ⚙️ Architecture
-Raw Data (3GB+) ─▶ S3 ─▶ EMR Cluster ─▶ PySpark + Word2Vec Embeddings
-                                                    │
-                                                    ├──▶ KNN (Collaborative Filtering)
-                                                    └──▶ TensorFlow Neural Network
-                                                    │
-                                                    ─▶ Job Predictions ─▶ Output to S3
+| Notebook | Stage |
+|---|---|
+| `Jobs.ipynb` | Clean job text, train Word2Vec, write per-window job vectors to S3 as Parquet |
+| `UserHistory.ipynb` | Embed each user's past job titles and average them into one history vector |
+| `UsersEda.ipynb` | Profile EDA and null audit, index categoricals, join history embeddings |
+| `Apps.ipynb` | Join applications to job and user vectors for a window |
+| `KNN.ipynb` | Represent each user as the mean of their applied-job vectors, then retrieve nearest jobs with LSH |
+| `Nueral_Net_Prep.ipynb` | Build training pairs: positives = applications, negatives = 3 sampled non-applied jobs per positive |
+| `Neural_Network.ipynb` | Train and evaluate the ranking MLP |
 
+## Models
 
-## 🛠️ Tools & Libraries
+**Retrieval (LSH-KNN).** Spark ML `BucketedRandomProjectionLSH` (3 hash tables) returns approximate nearest neighbors in embedding space, avoiding a full user × job distance matrix.
 
-- **PySpark** – distributed processing for large-scale data.
-- **Word2Vec (Spark MLlib)** – for embedding job descriptions and user behaviors.
-- **TensorFlow** – for building and training a neural network recommendation model.
-- **AWS EMR** – scalable cluster-based computation.
-- **Amazon S3** – used for data storage and checkpointing progress.
-- **KNN** – for collaborative filtering, leveraging user similarity.
+**Ranking (MLP).** Dense 256 → 128 → 64 → sigmoid with 0.3 dropout, trained with binary cross-entropy on concatenated user and job embeddings.
 
-## 🧪 Pipeline Summary
+## Results
 
-1. **Preprocessing**:
-   - Cleaned and vectorized user/job data with Word2Vec.
-   - Windowed data by timestamp to simulate batch training.
+| Model | Split | Accuracy | ROC-AUC |
+|---|---|---|---|
+| Ranking MLP | 20% held-out (window 6 sample) | 95.5% | 0.997 |
 
-2. **Collaborative Filtering**:
-   - Built a KNN model to find similar users and recommend jobs based on their behavior.
+**Caveats.** These numbers come from a small sampled subset of one window. The negatives are random non-applied jobs, which makes the task easier than ranking against the jobs a user actually considered. Treat them as proof that the pipeline works end to end, not as a production-level estimate.
 
-3. **Neural Network Prediction**:
-   - Joined user and job vectors.
-   - Fed combined embeddings into a TensorFlow model for prediction.
-   - Compared neural model performance against KNN baseline.
+## Known issues & next steps
 
-4. **Model Management**:
-   - Stored training checkpoints, embeddings, and results in S3 for tracking and reproducibility.
+- **Retrieval evaluation bug.** The precision@k calculation in `KNN.ipynb` labels a recommendation as a hit by checking whether `JobID` is non-null after a left join. `JobID` is the join key, so it is always non-null and precision comes out as exactly 1.0. The fix is to test a column that exists only on the applications side.
+- Evaluate on a later window than the one used for training (temporal split) with ranking metrics (precision@k, NDCG)
+- Sample hard negatives (jobs in the same city or category) instead of random ones
+- Replace averaged Word2Vec with a sentence-embedding model for job descriptions
 
-## ✅ Results
+## Running
 
-- Improved prediction accuracy over baseline KNN by 90%.
-- Enabled scalable training over 3GB dataset without local resource limits.
-
+The notebooks target an EMR Studio cluster with Spark preconfigured. Replace the `s3://…` paths with your own bucket, upload the Kaggle TSVs, and run the notebooks in the order listed in the table above.
